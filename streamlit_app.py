@@ -8,6 +8,10 @@ from datetime import datetime
 import os
 import io
 import base64
+from scipy.stats import shapiro, jarque_bera
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # Set page config
 st.set_page_config(
@@ -31,6 +35,8 @@ if 'markets_processed' not in st.session_state:
     st.session_state.markets_processed = False
 if 'weather_data' not in st.session_state:
     st.session_state.weather_data = None
+if 'min_price_threshold' not in st.session_state:
+    st.session_state.min_price_threshold = None
 
 # Custom CSS
 st.markdown("""
@@ -146,12 +152,30 @@ def validate_prices(df, min_price_threshold=100):
     return cleaned_df, stats
 
 def interpolate_data(df):
-    """Interpolate missing values using spline interpolation."""
+    """
+    Interpolate missing values using linear interpolation.
+    Args:
+        df: DataFrame with numeric columns to interpolate
+    Returns:
+        DataFrame with interpolated values
+    """
+    # Sort by date first
+    df = df.sort_values('Date')
+    
+    # Create a copy to avoid modifying original
+    df_copy = df.copy()
+    
     numeric_cols = ['Arrivals', 'Min', 'Max', 'Modal']
     for col in numeric_cols:
-        if col in df.columns:
-            df[col] = df[col].interpolate(method='spline', order=3)
-    return df
+        if col in df_copy.columns:
+            # Forward fill first to handle leading NAs
+            df_copy[col] = df_copy[col].fillna(method='ffill')
+            # Then interpolate remaining gaps
+            df_copy[col] = df_copy[col].interpolate(method='linear')
+            # Back fill any remaining trailing NAs
+            df_copy[col] = df_copy[col].fillna(method='bfill')
+    
+    return df_copy
 
 def process_weather_data(weather_df):
     """Process weather data and create date column."""
@@ -256,12 +280,33 @@ def parse_date(date_str):
         return pd.NaT
 
 def resample_data(df, freq='W'):
-    """Resample data to specified frequency."""
-    resampled_df = df.set_index('Date')['Modal'].resample(freq).mean().reset_index()
-    return resampled_df
+    """
+    Resample data to specified frequency.
+    Args:
+        df: DataFrame with Date and Modal columns
+        freq: Frequency for resampling ('W' for weekly, 'M' for monthly)
+    Returns:
+        DataFrame with resampled data
+    """
+    # Sort data by date first
+    df = df.sort_values('Date')
+    
+    # Set date as index and resample
+    df_resampled = df.set_index('Date')
+    
+    # Resample using mean and handle missing values
+    resampled = df_resampled['Modal'].resample(freq).mean()
+    
+    # Convert back to DataFrame and reset index
+    result = pd.DataFrame({'Date': resampled.index, 'Modal': resampled.values})
+    
+    return result
 
 def get_descriptive_stats(data, frequency="Daily"):
     """Calculate descriptive statistics for the given data."""
+    shapiro_stat, shapiro_p = shapiro(data['Modal'])
+    jb_stat, jb_p = jarque_bera(data['Modal'])
+    
     stats_dict = {
         'Descriptive statistics': [
             'Maximum (Rs./Quintal)',
@@ -270,7 +315,9 @@ def get_descriptive_stats(data, frequency="Daily"):
             'Standard deviation (Rs./Quintal)',
             'Coefficient of variation (%)',
             'Skewness',
-            'Kurtosis'
+            'Kurtosis',
+            "Shapiro–Wilk's test",
+            'Jarque–Bera test'
         ],
         frequency: [
             f"{data['Modal'].max():.2f}",
@@ -279,7 +326,9 @@ def get_descriptive_stats(data, frequency="Daily"):
             f"{data['Modal'].std():.2f}",
             f"{(data['Modal'].std() / data['Modal'].mean() * 100):.2f}",
             f"{data['Modal'].skew():.2f}",
-            f"{data['Modal'].kurtosis():.2f}"
+            f"{data['Modal'].kurtosis():.2f}",
+            f"{shapiro_stat:.2f} ({'< 0.0001' if shapiro_p < 0.0001 else f'{shapiro_p:.4f}'})",
+            f"{jb_stat:.2f} ({'< 0.0001' if jb_p < 0.0001 else f'{jb_p:.4f}'})"
         ]
     }
     return pd.DataFrame(stats_dict)
@@ -360,6 +409,217 @@ def merge_commodity_files(uploaded_files):
     
     return merged_df, processing_results
 
+def perform_seasonal_decomposition(data, freq):
+    """
+    Perform seasonal decomposition on time series data.
+    
+    Args:
+        data: DataFrame with Date and Modal columns
+        freq: Frequency for decomposition ('D' for daily, 'W' for weekly, 'M' for monthly)
+    
+    Returns:
+        Decomposition result object
+    """
+    # Set date as index
+    ts_data = data.set_index('Date')['Modal']
+    
+    # Determine period based on frequency
+    if freq == 'D':
+        period = 30  # Monthly seasonality for daily data
+    elif freq == 'W':
+        period = 52  # Yearly seasonality for weekly data
+    else:  # Monthly
+        period = 12  # Yearly seasonality for monthly data
+    
+    # Perform decomposition
+    decomposition = seasonal_decompose(
+        ts_data,
+        period=period,
+        extrapolate_trend='freq'
+    )
+    
+    return decomposition
+
+def plot_decomposition(decomposition, title):
+    """
+    Create an interactive plot for seasonal decomposition results.
+    
+    Args:
+        decomposition: Seasonal decomposition result object
+        title: Title for the plot
+    
+    Returns:
+        Plotly figure object
+    """
+    # Create subplot figure
+    fig = make_subplots(
+        rows=4, cols=1,
+        subplot_titles=('Observed', 'Trend', 'Seasonal', 'Residual'),
+        vertical_spacing=0.05,
+        shared_xaxes=True
+    )
+    
+    # Add traces for each component
+    fig.add_trace(
+        go.Scatter(x=decomposition.observed.index, y=decomposition.observed,
+                  mode='lines', name='Observed', line=dict(color='#1f77b4')),
+        row=1, col=1
+    )
+    
+    fig.add_trace(
+        go.Scatter(x=decomposition.trend.index, y=decomposition.trend,
+                  mode='lines', name='Trend', line=dict(color='#2ca02c')),
+        row=2, col=1
+    )
+    
+    fig.add_trace(
+        go.Scatter(x=decomposition.seasonal.index, y=decomposition.seasonal,
+                  mode='lines', name='Seasonal', line=dict(color='#ff7f0e')),
+        row=3, col=1
+    )
+    
+    fig.add_trace(
+        go.Scatter(x=decomposition.resid.index, y=decomposition.resid,
+                  mode='lines', name='Residual', line=dict(color='#d62728')),
+        row=4, col=1
+    )
+    
+    # Update layout
+    fig.update_layout(
+        height=800,
+        title=title,
+        showlegend=False,
+        hovermode='x unified'
+    )
+    
+    # Update y-axis titles
+    fig.update_yaxes(title_text='Price', row=1, col=1)
+    fig.update_yaxes(title_text='Trend', row=2, col=1)
+    fig.update_yaxes(title_text='Seasonal', row=3, col=1)
+    fig.update_yaxes(title_text='Residual', row=4, col=1)
+    
+    return fig
+
+def perform_adf_test(data, commodity_name):
+    """
+    Perform Augmented Dickey-Fuller test and format results.
+    
+    Args:
+        data: DataFrame with Modal price column
+        commodity_name: Name of the commodity/CVG
+    
+    Returns:
+        DataFrame with formatted ADF test results
+    """
+    # Perform ADF test
+    adf_result = adfuller(data['Modal'].dropna(), autolag='AIC')
+    
+    # Format p-value
+    p_value = adf_result[1]
+    p_value_formatted = '< 0.0001' if p_value < 0.0001 else f'{p_value:.4f}'
+    
+    # Determine stationarity
+    is_stationary = p_value < 0.05
+    remark = 'Stationary' if is_stationary else 'Non-Stationary'
+    
+    # Create results DataFrame
+    results_dict = {
+        'Data': [commodity_name],
+        'Test Statistic': [f'{adf_result[0]:.4f}'],
+        'p-value': [p_value_formatted],
+        'Lags Used': [adf_result[2]],
+        'Remarks': [remark]
+    }
+    
+    return pd.DataFrame(results_dict)
+
+def perform_bds_test(data, commodity_name):
+    """
+    Perform BDS test for independence of a time series.
+    
+    Args:
+        data: DataFrame with Modal price column
+        commodity_name: Name of the commodity/CVG
+    
+    Returns:
+        DataFrame with formatted BDS test results
+    """
+    # Prepare data
+    price_data = data['Modal'].dropna().values
+    
+    # Define distance multipliers for epsilon calculation
+    distances = [0.5, 1.0, 1.5, 2.0]
+    
+    results = []
+    for dist in distances:
+        try:
+            # Perform BDS test with max_dim=3 to get results for dimensions 2 and 3
+            bds_stat, p_value = bds(price_data, max_dim=3, distance=dist)
+            
+            # Process results for each dimension (results start from dimension 2)
+            for dim in range(2, 4):  # dimensions 2 and 3
+                idx = dim - 2  # index in the results array
+                
+                # Get statistics for current dimension
+                stat = bds_stat[idx] if isinstance(bds_stat, np.ndarray) else bds_stat
+                p_val = p_value[idx] if isinstance(p_value, np.ndarray) else p_value
+                
+                # Format p-value
+                p_value_formatted = '< 0.0001' if p_val < 0.0001 else f'{p_val:.4f}'
+                
+                # Determine independence based on p-value
+                if p_val < 0.0001:
+                    interpretation = 'Strong evidence against i.i.d.'
+                elif p_val < 0.05:
+                    interpretation = 'Evidence against i.i.d.'
+                else:
+                    interpretation = 'No evidence against i.i.d.'
+                
+                results.append({
+                    'Agricultural Crops': commodity_name,
+                    'Distance Multiplier': f'{dist:.1f}',
+                    'Dimension (m)': dim,
+                    'BDS Statistic': f'{stat:.4f}',
+                    'p-value': p_value_formatted,
+                    'Interpretation': interpretation
+                })
+        except Exception as e:
+            print(f"Error in BDS test for distance {dist}: {str(e)}")
+            results.append({
+                'Agricultural Crops': commodity_name,
+                'Distance Multiplier': f'{dist:.1f}',
+                'Dimension (m)': 'Error',
+                'BDS Statistic': 'Error',
+                'p-value': 'Error',
+                'Interpretation': str(e)
+            })
+    
+    return pd.DataFrame(results)
+
+def resample_weather_data(data, freq='W'):
+    """
+    Resample weather data to specified frequency.
+    
+    Args:
+        data: DataFrame with Date and weather variables
+        freq: Frequency for resampling ('W' for weekly, 'M' for monthly)
+    
+    Returns:
+        DataFrame with resampled data
+    """
+    # Set date as index
+    df = data.copy()
+    df = df.set_index('Date')
+    
+    # Resample all numeric columns
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    resampled = df[numeric_cols].resample(freq).mean()
+    
+    # Reset index to get Date back as column
+    resampled = resampled.reset_index()
+    
+    return resampled
+
 def main():
     st.title("🌾 Agricultural Commodity Price Analysis")
     
@@ -391,6 +651,15 @@ def main():
                 weather_df = pd.read_csv(weather_file)
                 st.session_state.weather_data = process_weather_data(weather_df)
                 st.success("Weather data processed successfully!")
+                
+                # Display weather data summary
+                st.markdown("#### Weather Data Summary")
+                weather_summary = {
+                    'Date Range': f"{st.session_state.weather_data['Date'].min().strftime('%Y-%m-%d')} to {st.session_state.weather_data['Date'].max().strftime('%Y-%m-%d')}",
+                    'Total Records': len(st.session_state.weather_data),
+                    'Variables Available': ', '.join([col for col in st.session_state.weather_data.columns if col != 'Date'])
+                }
+                st.table(pd.DataFrame([weather_summary]).T.rename(columns={0: 'Value'}))
             except Exception as e:
                 st.error(f"Error processing weather file: {str(e)}")
                 st.session_state.weather_data = None
@@ -445,6 +714,349 @@ def main():
                 st.session_state.date_processed = True
             else:
                 df = st.session_state.processed_df
+
+            # Weather Data Analysis Section
+            if st.session_state.weather_data is not None:
+                st.markdown("## Weather Data Analysis")
+                st.markdown("### Correlation Analysis with Commodity Prices")
+                
+                # Select commodity and CVG for correlation analysis
+                unique_commodities = sorted(df['Commodity'].unique())
+                selected_commodity = st.selectbox(
+                    "Select Commodity for Weather Analysis",
+                    unique_commodities,
+                    key="weather_commodity"
+                )
+                
+                # Filter data for selected commodity
+                commodity_df = df[df['Commodity'] == selected_commodity]
+                
+                # Create CVG identifier
+                commodity_df['CVG'] = commodity_df.apply(create_cvg_identifier, axis=1)
+                cvg_options = sorted(commodity_df['CVG'].unique())
+                
+                selected_cvg = st.selectbox(
+                    "Select CVG for Weather Analysis",
+                    cvg_options,
+                    key="weather_cvg"
+                )
+                
+                if st.button("Analyze Weather Correlations"):
+                    with st.spinner("Calculating correlations..."):
+                        # Filter data for selected CVG
+                        cvg_data = commodity_df[commodity_df['CVG'] == selected_cvg].copy()
+                        
+                        # Create tabs for different frequencies
+                        daily_tab, weekly_tab, monthly_tab = st.tabs(["Daily Data", "Weekly Data", "Monthly Data"])
+                        
+                        # Daily Analysis
+                        with daily_tab:
+                            st.markdown("#### Daily Weather Correlations")
+                            
+                            # Merge price and weather data
+                            merged_daily = pd.merge(
+                                cvg_data[['Date', 'Modal']],
+                                st.session_state.weather_data,
+                                on='Date',
+                                how='inner'
+                            )
+                            
+                            if len(merged_daily) > 0:
+                                # Calculate correlations for daily data
+                                weather_vars = [col for col in merged_daily.columns if col not in ['Date', 'Modal']]
+                                daily_correlations = []
+                                
+                                for var in weather_vars:
+                                    correlation = merged_daily['Modal'].corr(pd.to_numeric(merged_daily[var], errors='coerce'))
+                                    _, p_value = stats.pearsonr(
+                                        pd.to_numeric(merged_daily['Modal'], errors='coerce'),
+                                        pd.to_numeric(merged_daily[var], errors='coerce')
+                                    )
+                                    
+                                    daily_correlations.append({
+                                        'Weather Variable': var,
+                                        'Correlation': f"{correlation:.4f}",
+                                        'p-value': '< 0.0001' if p_value < 0.0001 else f"{p_value:.4f}",
+                                        'Significance': '***' if p_value < 0.001 else '**' if p_value < 0.01 else '*' if p_value < 0.05 else 'ns'
+                                    })
+                                
+                                # Display daily correlation results
+                                daily_corr_df = pd.DataFrame(daily_correlations)
+                                st.markdown("##### Correlation Results (Daily)")
+                                st.markdown("""
+                                Significance levels:
+                                - *** : p < 0.001
+                                - ** : p < 0.01
+                                - * : p < 0.05
+                                - ns : not significant
+                                """)
+                                st.table(daily_corr_df.style.set_properties(**{
+                                    'text-align': 'center',
+                                    'font-size': '1em'
+                                }))
+                                
+                                # Daily correlation visualization
+                                st.markdown("##### Correlation Visualization (Daily)")
+                                fig = px.bar(
+                                    daily_corr_df,
+                                    x='Weather Variable',
+                                    y='Correlation',
+                                    title=f'Daily Weather Variable Correlations with {selected_cvg} Prices',
+                                    labels={'Correlation': 'Correlation Coefficient'}
+                                )
+                                fig.update_layout(
+                                    xaxis_tickangle=-45,
+                                    showlegend=False,
+                                    height=500
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
+                                
+                                # Daily time series plots
+                                st.markdown("##### Time Series Visualization (Daily)")
+                                for var in weather_vars:
+                                    fig = make_subplots(specs=[[{"secondary_y": True}]])
+                                    
+                                    fig.add_trace(
+                                        go.Scatter(
+                                            x=merged_daily['Date'],
+                                            y=merged_daily['Modal'],
+                                            name='Price',
+                                            line=dict(color='blue')
+                                        ),
+                                        secondary_y=False
+                                    )
+                                    
+                                    fig.add_trace(
+                                        go.Scatter(
+                                            x=merged_daily['Date'],
+                                            y=pd.to_numeric(merged_daily[var], errors='coerce'),
+                                            name=var,
+                                            line=dict(color='red')
+                                        ),
+                                        secondary_y=True
+                                    )
+                                    
+                                    fig.update_layout(
+                                        title=f'{var} vs Price Over Time (Daily)',
+                                        xaxis_title='Date',
+                                        height=400
+                                    )
+                                    fig.update_yaxes(title_text="Price (Rs./Quintal)", secondary_y=False)
+                                    fig.update_yaxes(title_text=var, secondary_y=True)
+                                    
+                                    st.plotly_chart(fig, use_container_width=True)
+                            else:
+                                st.warning("No matching dates found between daily weather and price data.")
+                        
+                        # Weekly Analysis
+                        with weekly_tab:
+                            st.markdown("#### Weekly Weather Correlations")
+                            
+                            # Resample price data to weekly
+                            weekly_price = resample_data(cvg_data[['Date', 'Modal']], 'W')
+                            
+                            # Resample weather data to weekly
+                            weekly_weather = resample_weather_data(st.session_state.weather_data, 'W')
+                            
+                            # Merge weekly data
+                            merged_weekly = pd.merge(
+                                weekly_price,
+                                weekly_weather,
+                                on='Date',
+                                how='inner'
+                            )
+                            
+                            if len(merged_weekly) > 0:
+                                # Calculate correlations for weekly data
+                                weather_vars = [col for col in merged_weekly.columns if col not in ['Date', 'Modal']]
+                                weekly_correlations = []
+                                
+                                for var in weather_vars:
+                                    correlation = merged_weekly['Modal'].corr(pd.to_numeric(merged_weekly[var], errors='coerce'))
+                                    _, p_value = stats.pearsonr(
+                                        pd.to_numeric(merged_weekly['Modal'], errors='coerce'),
+                                        pd.to_numeric(merged_weekly[var], errors='coerce')
+                                    )
+                                    
+                                    weekly_correlations.append({
+                                        'Weather Variable': var,
+                                        'Correlation': f"{correlation:.4f}",
+                                        'p-value': '< 0.0001' if p_value < 0.0001 else f"{p_value:.4f}",
+                                        'Significance': '***' if p_value < 0.001 else '**' if p_value < 0.01 else '*' if p_value < 0.05 else 'ns'
+                                    })
+                                
+                                # Display weekly correlation results
+                                weekly_corr_df = pd.DataFrame(weekly_correlations)
+                                st.markdown("##### Correlation Results (Weekly)")
+                                st.markdown("""
+                                Significance levels:
+                                - *** : p < 0.001
+                                - ** : p < 0.01
+                                - * : p < 0.05
+                                - ns : not significant
+                                """)
+                                st.table(weekly_corr_df.style.set_properties(**{
+                                    'text-align': 'center',
+                                    'font-size': '1em'
+                                }))
+                                
+                                # Weekly correlation visualization
+                                st.markdown("##### Correlation Visualization (Weekly)")
+                                fig = px.bar(
+                                    weekly_corr_df,
+                                    x='Weather Variable',
+                                    y='Correlation',
+                                    title=f'Weekly Weather Variable Correlations with {selected_cvg} Prices',
+                                    labels={'Correlation': 'Correlation Coefficient'}
+                                )
+                                fig.update_layout(
+                                    xaxis_tickangle=-45,
+                                    showlegend=False,
+                                    height=500
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
+                                
+                                # Weekly time series plots
+                                st.markdown("##### Time Series Visualization (Weekly)")
+                                for var in weather_vars:
+                                    fig = make_subplots(specs=[[{"secondary_y": True}]])
+                                    
+                                    fig.add_trace(
+                                        go.Scatter(
+                                            x=merged_weekly['Date'],
+                                            y=merged_weekly['Modal'],
+                                            name='Price',
+                                            line=dict(color='blue')
+                                        ),
+                                        secondary_y=False
+                                    )
+                                    
+                                    fig.add_trace(
+                                        go.Scatter(
+                                            x=merged_weekly['Date'],
+                                            y=pd.to_numeric(merged_weekly[var], errors='coerce'),
+                                            name=var,
+                                            line=dict(color='red')
+                                        ),
+                                        secondary_y=True
+                                    )
+                                    
+                                    fig.update_layout(
+                                        title=f'{var} vs Price Over Time (Weekly)',
+                                        xaxis_title='Date',
+                                        height=400
+                                    )
+                                    fig.update_yaxes(title_text="Price (Rs./Quintal)", secondary_y=False)
+                                    fig.update_yaxes(title_text=var, secondary_y=True)
+                                    
+                                    st.plotly_chart(fig, use_container_width=True)
+                            else:
+                                st.warning("No matching dates found between weekly weather and price data.")
+                        
+                        # Monthly Analysis
+                        with monthly_tab:
+                            st.markdown("#### Monthly Weather Correlations")
+                            
+                            # Resample price data to monthly
+                            monthly_price = resample_data(cvg_data[['Date', 'Modal']], 'M')
+                            
+                            # Resample weather data to monthly
+                            monthly_weather = resample_weather_data(st.session_state.weather_data, 'M')
+                            
+                            # Merge monthly data
+                            merged_monthly = pd.merge(
+                                monthly_price,
+                                monthly_weather,
+                                on='Date',
+                                how='inner'
+                            )
+                            
+                            if len(merged_monthly) > 0:
+                                # Calculate correlations for monthly data
+                                weather_vars = [col for col in merged_monthly.columns if col not in ['Date', 'Modal']]
+                                monthly_correlations = []
+                                
+                                for var in weather_vars:
+                                    correlation = merged_monthly['Modal'].corr(pd.to_numeric(merged_monthly[var], errors='coerce'))
+                                    _, p_value = stats.pearsonr(
+                                        pd.to_numeric(merged_monthly['Modal'], errors='coerce'),
+                                        pd.to_numeric(merged_monthly[var], errors='coerce')
+                                    )
+                                    
+                                    monthly_correlations.append({
+                                        'Weather Variable': var,
+                                        'Correlation': f"{correlation:.4f}",
+                                        'p-value': '< 0.0001' if p_value < 0.0001 else f"{p_value:.4f}",
+                                        'Significance': '***' if p_value < 0.001 else '**' if p_value < 0.01 else '*' if p_value < 0.05 else 'ns'
+                                    })
+                                
+                                # Display monthly correlation results
+                                monthly_corr_df = pd.DataFrame(monthly_correlations)
+                                st.markdown("##### Correlation Results (Monthly)")
+                                st.markdown("""
+                                Significance levels:
+                                - *** : p < 0.001
+                                - ** : p < 0.01
+                                - * : p < 0.05
+                                - ns : not significant
+                                """)
+                                st.table(monthly_corr_df.style.set_properties(**{
+                                    'text-align': 'center',
+                                    'font-size': '1em'
+                                }))
+                                
+                                # Monthly correlation visualization
+                                st.markdown("##### Correlation Visualization (Monthly)")
+                                fig = px.bar(
+                                    monthly_corr_df,
+                                    x='Weather Variable',
+                                    y='Correlation',
+                                    title=f'Monthly Weather Variable Correlations with {selected_cvg} Prices',
+                                    labels={'Correlation': 'Correlation Coefficient'}
+                                )
+                                fig.update_layout(
+                                    xaxis_tickangle=-45,
+                                    showlegend=False,
+                                    height=500
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
+                                
+                                # Monthly time series plots
+                                st.markdown("##### Time Series Visualization (Monthly)")
+                                for var in weather_vars:
+                                    fig = make_subplots(specs=[[{"secondary_y": True}]])
+                                    
+                                    fig.add_trace(
+                                        go.Scatter(
+                                            x=merged_monthly['Date'],
+                                            y=merged_monthly['Modal'],
+                                            name='Price',
+                                            line=dict(color='blue')
+                                        ),
+                                        secondary_y=False
+                                    )
+                                    
+                                    fig.add_trace(
+                                        go.Scatter(
+                                            x=merged_monthly['Date'],
+                                            y=pd.to_numeric(merged_monthly[var], errors='coerce'),
+                                            name=var,
+                                            line=dict(color='red')
+                                        ),
+                                        secondary_y=True
+                                    )
+                                    
+                                    fig.update_layout(
+                                        title=f'{var} vs Price Over Time (Monthly)',
+                                        xaxis_title='Date',
+                                        height=400
+                                    )
+                                    fig.update_yaxes(title_text="Price (Rs./Quintal)", secondary_y=False)
+                                    fig.update_yaxes(title_text=var, secondary_y=True)
+                                    
+                                    st.plotly_chart(fig, use_container_width=True)
+                            else:
+                                st.warning("No matching dates found between monthly weather and price data.")
             
             # Display data summary
             with st.expander("View Data Summary"):
@@ -469,6 +1081,7 @@ def main():
                 st.session_state.selected_markets = []
                 st.session_state.best_cvgs = None
                 st.session_state.selected_cvg = None
+                st.session_state.min_price_threshold = None
                 st.experimental_rerun()
             
             # Proceed directly to Step 2: Market Selection
@@ -561,19 +1174,43 @@ def main():
                             st.session_state.selected_markets = []
                             st.session_state.best_cvgs = None
                             st.session_state.selected_cvg = None
+                            st.session_state.min_price_threshold = None
                             st.experimental_rerun()
                         
                         # Add Start Analysis button
                         st.markdown("## Step 3: Analysis")
+                        
+                        # Add minimum price threshold selection before analysis starts
+                        st.markdown("### Set Minimum Price Threshold")
+                        st.markdown("Set the minimum acceptable price for detecting unrealistic values.")
+                        
+                        # Get current minimum price for reference
+                        cvg_data = commodity_df[commodity_df['CVG'] == selected_cvg].copy()
+                        current_min = cvg_data['Modal'].min()
+                        suggested_min = max(50, round(current_min * 0.5))  # Suggest 50% of current minimum or 50, whichever is higher
+                        
+                        # Use session state for min_price_threshold
+                        if st.session_state.min_price_threshold is None:
+                            st.session_state.min_price_threshold = suggested_min
+                        
+                        min_price_threshold = st.number_input(
+                            "Minimum Price Threshold (Rs./Quintal)",
+                            min_value=1,
+                            max_value=1000,
+                            value=st.session_state.min_price_threshold,
+                            help="Values below this threshold will be considered unrealistic and removed. Default is suggested based on the data.",
+                            key="min_price_input"
+                        )
+                        
+                        # Update session state with new threshold
+                        st.session_state.min_price_threshold = min_price_threshold
+                        
                         start_analysis = st.button("🚀 Start Analysis", use_container_width=True)
                         
                         if start_analysis:
                             with st.spinner("Performing analysis..."):
-                                # Filter data for selected CVG
-                                cvg_data = commodity_df[commodity_df['CVG'] == selected_cvg].copy()
-                                
-                                # Validate and clean price data
-                                cvg_data, validation_stats = validate_prices(cvg_data)
+                                # Validate and clean price data with user-defined threshold
+                                cvg_data, validation_stats = validate_prices(cvg_data, min_price_threshold=st.session_state.min_price_threshold)
                                 
                                 # Display validation results
                                 st.markdown("### Data Validation Results")
@@ -584,15 +1221,23 @@ def main():
                                 """)
                                 
                                 if validation_stats['unrealistic_records'] > 0:
-                                    st.warning(f"⚠️ Removed {validation_stats['unrealistic_records']} records with unrealistic prices (below 100 Rs./Quintal)")
+                                    st.warning(f"⚠️ Removed {validation_stats['unrealistic_records']} records with prices below {min_price_threshold} Rs./Quintal")
                                 
                                 # Proceed only if we have enough data after validation
                                 if len(cvg_data) < 100:
-                                    st.error("❌ Insufficient data remaining after removing unrealistic values. Please check your data or select a different CVG.")
+                                    st.error("❌ Insufficient data remaining after removing unrealistic values. Please adjust the minimum price threshold or select a different CVG.")
                                     return
                                 
-                                # Interpolate remaining data
+                                # First interpolate the daily data
                                 cvg_data = interpolate_data(cvg_data)
+                                
+                                # Then create resampled versions
+                                weekly_data = resample_data(cvg_data, 'W')
+                                monthly_data = resample_data(cvg_data, 'ME')
+                                
+                                # Ensure no missing values in resampled data
+                                weekly_data = interpolate_data(weekly_data)
+                                monthly_data = interpolate_data(monthly_data)
                                 
                                 # Perform basic analysis
                                 analysis_results = analyze_data(cvg_data)
@@ -652,6 +1297,7 @@ def main():
                                     # Daily Data Tab
                                     with daily_tab:
                                         st.markdown("#### Daily Price Data")
+                                        
                                         # Display daily statistics
                                         daily_stats = get_descriptive_stats(cvg_data, "Daily")
                                         daily_stats = daily_stats.set_index('Descriptive statistics')
@@ -660,10 +1306,48 @@ def main():
                                             'font-size': '1em'
                                         }))
                                         
-                                        # Display daily data
-                                        display_df = cvg_data[['Date', 'Modal']].copy()
-                                        display_df['Date'] = display_df['Date'].dt.strftime('%Y-%m-%d')
-                                        st.dataframe(display_df)
+                                        # Display ADF test results
+                                        st.markdown("#### Stationarity Test (Daily Data)")
+                                        daily_adf = perform_adf_test(cvg_data, selected_cvg)
+                                        st.table(daily_adf.style.set_properties(**{
+                                            'text-align': 'center',
+                                            'font-size': '1em'
+                                        }))
+                                        
+                                        # Display BDS test results
+                                        st.markdown("#### Nonlinearity Test (Daily Data)")
+                                        try:
+                                            daily_bds = perform_bds_test(cvg_data, selected_cvg)
+                                            st.markdown("BDS test results for different epsilon values (multiples of standard deviation σ):")
+                                            st.table(daily_bds.style.set_properties(**{
+                                                'text-align': 'center',
+                                                'font-size': '1em'
+                                            }))
+                                        except Exception as e:
+                                            st.error(f"Error in BDS test: {str(e)}")
+                                        
+                                        # Interactive line chart for daily data
+                                        fig_daily = px.line(
+                                            cvg_data, x='Date', y='Modal',
+                                            title='Daily Price Data',
+                                            labels={'Modal': 'Price (Rs./Quintal)', 'Date': 'Date'},
+                                            markers=True
+                                        )
+                                        fig_daily.update_traces(connectgaps=False)
+                                        fig_daily.update_layout(hovermode='x unified')
+                                        st.plotly_chart(fig_daily, use_container_width=True)
+                                        
+                                        # Seasonal Decomposition for Daily Data
+                                        st.markdown("#### Time Series Decomposition (Daily)")
+                                        try:
+                                            daily_decomposition = perform_seasonal_decomposition(cvg_data, 'D')
+                                            fig_daily_decomp = plot_decomposition(
+                                                daily_decomposition,
+                                                'Daily Price Time Series Decomposition'
+                                            )
+                                            st.plotly_chart(fig_daily_decomp, use_container_width=True)
+                                        except Exception as e:
+                                            st.warning(f"Could not perform daily decomposition: {str(e)}")
                                         
                                         # Download link for daily data
                                         csv_df = cvg_data[['Date', 'Modal']].copy()
@@ -675,8 +1359,6 @@ def main():
                                     # Weekly Data Tab
                                     with weekly_tab:
                                         st.markdown("#### Weekly Price Data")
-                                        # Resample to weekly frequency
-                                        weekly_data = resample_data(cvg_data, 'W')
                                         
                                         # Display weekly statistics
                                         weekly_stats = get_descriptive_stats(weekly_data, "Weekly")
@@ -686,10 +1368,48 @@ def main():
                                             'font-size': '1em'
                                         }))
                                         
-                                        # Display weekly data
-                                        display_weekly = weekly_data.copy()
-                                        display_weekly['Date'] = display_weekly['Date'].dt.strftime('%Y-%m-%d')
-                                        st.dataframe(display_weekly)
+                                        # Display ADF test results
+                                        st.markdown("#### Stationarity Test (Weekly Data)")
+                                        weekly_adf = perform_adf_test(weekly_data, selected_cvg)
+                                        st.table(weekly_adf.style.set_properties(**{
+                                            'text-align': 'center',
+                                            'font-size': '1em'
+                                        }))
+                                        
+                                        # Display BDS test results
+                                        st.markdown("#### Nonlinearity Test (Weekly Data)")
+                                        try:
+                                            weekly_bds = perform_bds_test(weekly_data, selected_cvg)
+                                            st.markdown("BDS test results for different epsilon values (multiples of standard deviation σ):")
+                                            st.table(weekly_bds.style.set_properties(**{
+                                                'text-align': 'center',
+                                                'font-size': '1em'
+                                            }))
+                                        except Exception as e:
+                                            st.error(f"Error in BDS test: {str(e)}")
+                                        
+                                        # Interactive line chart for weekly data
+                                        fig_weekly = px.line(
+                                            weekly_data, x='Date', y='Modal',
+                                            title='Weekly Price Data',
+                                            labels={'Modal': 'Price (Rs./Quintal)', 'Date': 'Date'},
+                                            markers=True
+                                        )
+                                        fig_weekly.update_traces(connectgaps=False)
+                                        fig_weekly.update_layout(hovermode='x unified')
+                                        st.plotly_chart(fig_weekly, use_container_width=True)
+                                        
+                                        # Seasonal Decomposition for Weekly Data
+                                        st.markdown("#### Time Series Decomposition (Weekly)")
+                                        try:
+                                            weekly_decomposition = perform_seasonal_decomposition(weekly_data, 'W')
+                                            fig_weekly_decomp = plot_decomposition(
+                                                weekly_decomposition,
+                                                'Weekly Price Time Series Decomposition'
+                                            )
+                                            st.plotly_chart(fig_weekly_decomp, use_container_width=True)
+                                        except Exception as e:
+                                            st.warning(f"Could not perform weekly decomposition: {str(e)}")
                                         
                                         # Download link for weekly data
                                         weekly_csv = weekly_data.copy()
@@ -701,8 +1421,6 @@ def main():
                                     # Monthly Data Tab
                                     with monthly_tab:
                                         st.markdown("#### Monthly Price Data")
-                                        # Resample to monthly frequency
-                                        monthly_data = resample_data(cvg_data, 'M')
                                         
                                         # Display monthly statistics
                                         monthly_stats = get_descriptive_stats(monthly_data, "Monthly")
@@ -712,10 +1430,48 @@ def main():
                                             'font-size': '1em'
                                         }))
                                         
-                                        # Display monthly data
-                                        display_monthly = monthly_data.copy()
-                                        display_monthly['Date'] = display_monthly['Date'].dt.strftime('%Y-%m-%d')
-                                        st.dataframe(display_monthly)
+                                        # Display ADF test results
+                                        st.markdown("#### Stationarity Test (Monthly Data)")
+                                        monthly_adf = perform_adf_test(monthly_data, selected_cvg)
+                                        st.table(monthly_adf.style.set_properties(**{
+                                            'text-align': 'center',
+                                            'font-size': '1em'
+                                        }))
+                                        
+                                        # Display BDS test results
+                                        st.markdown("#### Nonlinearity Test (Monthly Data)")
+                                        try:
+                                            monthly_bds = perform_bds_test(monthly_data, selected_cvg)
+                                            st.markdown("BDS test results for different epsilon values (multiples of standard deviation σ):")
+                                            st.table(monthly_bds.style.set_properties(**{
+                                                'text-align': 'center',
+                                                'font-size': '1em'
+                                            }))
+                                        except Exception as e:
+                                            st.error(f"Error in BDS test: {str(e)}")
+                                        
+                                        # Interactive line chart for monthly data
+                                        fig_monthly = px.line(
+                                            monthly_data, x='Date', y='Modal',
+                                            title='Monthly Price Data',
+                                            labels={'Modal': 'Price (Rs./Quintal)', 'Date': 'Date'},
+                                            markers=True
+                                        )
+                                        fig_monthly.update_traces(connectgaps=False)
+                                        fig_monthly.update_layout(hovermode='x unified')
+                                        st.plotly_chart(fig_monthly, use_container_width=True)
+                                        
+                                        # Seasonal Decomposition for Monthly Data
+                                        st.markdown("#### Time Series Decomposition (Monthly)")
+                                        try:
+                                            monthly_decomposition = perform_seasonal_decomposition(monthly_data, 'M')
+                                            fig_monthly_decomp = plot_decomposition(
+                                                monthly_decomposition,
+                                                'Monthly Price Time Series Decomposition'
+                                            )
+                                            st.plotly_chart(fig_monthly_decomp, use_container_width=True)
+                                        except Exception as e:
+                                            st.warning(f"Could not perform monthly decomposition: {str(e)}")
                                         
                                         # Download link for monthly data
                                         monthly_csv = monthly_data.copy()
