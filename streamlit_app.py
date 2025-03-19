@@ -119,7 +119,7 @@ def select_best_cvgs(df, n=3, preferred_markets=None):
     
     return best_cvgs
 
-def validate_prices(df, min_price_threshold=100):
+def validate_prices(df, min_price_threshold=200):
     """
     Validate and clean price data by removing unrealistic values.
     Args:
