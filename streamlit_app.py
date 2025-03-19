@@ -12,12 +12,14 @@ from scipy.stats import shapiro, jarque_bera
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from statsmodels.tsa.arima.model import ARIMA
 
-# Set page config
+# Set page config with mobile-friendly defaults
 st.set_page_config(
-    page_title="Agricultural Commodity Price Analysis",
+    page_title="Agricultural Price Analysis",
     page_icon="🌾",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="collapsed"  # Better for mobile
 )
 
 # Initialize session state
@@ -37,21 +39,81 @@ if 'weather_data' not in st.session_state:
     st.session_state.weather_data = None
 if 'min_price_threshold' not in st.session_state:
     st.session_state.min_price_threshold = None
+if 'start_date' not in st.session_state:
+    st.session_state.start_date = None
+if 'end_date' not in st.session_state:
+    st.session_state.end_date = None
+if 'filtered_data' not in st.session_state:
+    st.session_state.filtered_data = None
+if 'date_range_selected' not in st.session_state:
+    st.session_state.date_range_selected = False
 
-# Custom CSS
+# Custom CSS for mobile responsiveness and professional look
 st.markdown("""
     <style>
     .main {
-        padding: 2rem;
+        padding: 1rem;
     }
     .stButton>button {
         width: 100%;
+        background-color: #0e4da4;
+        color: white;
+        border-radius: 4px;
+        padding: 0.5rem;
+        border: none;
+    }
+    .stButton>button:hover {
+        background-color: #0b3d83;
     }
     .analysis-section {
-        background-color: #f0f2f6;
+        background-color: #f8f9fa;
         padding: 1rem;
         border-radius: 0.5rem;
         margin-bottom: 1rem;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+    }
+    /* Mobile-friendly adjustments */
+    @media (max-width: 768px) {
+        .main {
+            padding: 0.5rem;
+        }
+        .stButton>button {
+            padding: 0.3rem;
+            font-size: 0.9rem;
+        }
+        .analysis-section {
+            padding: 0.5rem;
+        }
+        .dataframe {
+            font-size: 0.8rem;
+        }
+    }
+    /* Professional table styling */
+    .dataframe {
+        width: 100%;
+        border-collapse: collapse;
+    }
+    .dataframe th {
+        background-color: #f1f3f4;
+        padding: 8px;
+        text-align: center;
+    }
+    .dataframe td {
+        padding: 8px;
+        text-align: center;
+    }
+    /* Tab styling */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        padding: 8px 16px;
+        background-color: #f8f9fa;
+        border-radius: 4px;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #0e4da4;
+        color: white;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -119,7 +181,7 @@ def select_best_cvgs(df, n=3, preferred_markets=None):
     
     return best_cvgs
 
-def validate_prices(df, min_price_threshold=200):
+def validate_prices(df, min_price_threshold=100):
     """
     Validate and clean price data by removing unrealistic values.
     Args:
@@ -151,31 +213,20 @@ def validate_prices(df, min_price_threshold=200):
     
     return cleaned_df, stats
 
-def interpolate_data(df):
-    """
-    Interpolate missing values using linear interpolation.
-    Args:
-        df: DataFrame with numeric columns to interpolate
-    Returns:
-        DataFrame with interpolated values
-    """
-    # Sort by date first
-    df = df.sort_values('Date')
+def smart_interpolate(df):
+    """Optimized interpolation function."""
+    df = df.copy()
+    df = df.set_index('Date')
     
-    # Create a copy to avoid modifying original
-    df_copy = df.copy()
+    for col in ['Modal', 'Min', 'Max', 'Arrivals']:
+        if col in df.columns:
+            # Combine methods for better performance
+            df[col] = (df[col]
+                      .interpolate(method='linear', limit_direction='both')
+                      .fillna(method='ffill')
+                      .fillna(method='bfill'))
     
-    numeric_cols = ['Arrivals', 'Min', 'Max', 'Modal']
-    for col in numeric_cols:
-        if col in df_copy.columns:
-            # Forward fill first to handle leading NAs
-            df_copy[col] = df_copy[col].fillna(method='ffill')
-            # Then interpolate remaining gaps
-            df_copy[col] = df_copy[col].interpolate(method='linear')
-            # Back fill any remaining trailing NAs
-            df_copy[col] = df_copy[col].fillna(method='bfill')
-    
-    return df_copy
+    return df.reset_index()
 
 def process_weather_data(weather_df):
     """Process weather data and create date column."""
@@ -319,7 +370,7 @@ def get_descriptive_stats(data, frequency="Daily"):
             "Shapiro–Wilk's test",
             'Jarque–Bera test'
         ],
-        frequency: [
+        'Value': [  # Changed from frequency to 'Value' for consistent column name
             f"{data['Modal'].max():.2f}",
             f"{data['Modal'].mean():.2f}",
             f"{data['Modal'].min():.2f}",
@@ -331,7 +382,10 @@ def get_descriptive_stats(data, frequency="Daily"):
             f"{jb_stat:.2f} ({'< 0.0001' if jb_p < 0.0001 else f'{jb_p:.4f}'})"
         ]
     }
-    return pd.DataFrame(stats_dict)
+    # Convert to DataFrame and explicitly set data types
+    df = pd.DataFrame(stats_dict)
+    df = df.astype({'Descriptive statistics': str, 'Value': str})
+    return df
 
 def auto_process_dates(df):
     """Automatically process dates and handle invalid entries."""
@@ -1082,6 +1136,10 @@ def main():
                 st.session_state.best_cvgs = None
                 st.session_state.selected_cvg = None
                 st.session_state.min_price_threshold = None
+                st.session_state.start_date = None
+                st.session_state.end_date = None
+                st.session_state.filtered_data = None
+                st.session_state.date_range_selected = False
                 st.experimental_rerun()
             
             # Proceed directly to Step 2: Market Selection
@@ -1175,10 +1233,11 @@ def main():
                             st.session_state.best_cvgs = None
                             st.session_state.selected_cvg = None
                             st.session_state.min_price_threshold = None
+                            st.session_state.start_date = None
+                            st.session_state.end_date = None
+                            st.session_state.filtered_data = None
+                            st.session_state.date_range_selected = False
                             st.experimental_rerun()
-                        
-                        # Add Start Analysis button
-                        st.markdown("## Step 3: Analysis")
                         
                         # Add minimum price threshold selection before analysis starts
                         st.markdown("### Set Minimum Price Threshold")
@@ -1204,287 +1263,232 @@ def main():
                         
                         # Update session state with new threshold
                         st.session_state.min_price_threshold = min_price_threshold
+
+                        # Validate and clean price data with user-defined threshold
+                        cvg_data, validation_stats = validate_prices(cvg_data, min_price_threshold=st.session_state.min_price_threshold)
                         
+                        # Display validation results
+                        st.markdown("### Data Validation Results")
+                        st.markdown(f"""
+                        - Original records: {validation_stats['original_records']:,}
+                        - Unrealistic records removed: {validation_stats['unrealistic_records']:,} ({validation_stats['removed_percentage']:.2f}%)
+                        - Remaining records: {validation_stats['remaining_records']:,}
+                        """)
+                        
+                        if validation_stats['unrealistic_records'] > 0:
+                            st.warning(f"⚠️ Removed {validation_stats['unrealistic_records']} records with prices below {min_price_threshold} Rs./Quintal")
+                        
+                        # Proceed only if we have enough data after validation
+                        if len(cvg_data) < 100:
+                            st.error("❌ Insufficient data remaining after removing unrealistic values. Please adjust the minimum price threshold or select a different CVG.")
+                            return
+
+                        # Display initial daily plot for date range selection
+                        st.markdown("### 📊 Preview Data and Select Date Range")
+                        st.markdown("Review the data below and select a custom date range to exclude periods with missing data or flat lines.")
+                        
+                        # Create initial plot
+                        fig_preview = px.line(
+                            cvg_data, x='Date', y='Modal',
+                            title='Daily Price Data Preview',
+                            labels={'Modal': 'Price (Rs./Quintal)', 'Date': 'Date'},
+                            markers=True
+                        )
+                        fig_preview.update_traces(connectgaps=False)
+                        fig_preview.update_layout(hovermode='x unified')
+                        st.plotly_chart(fig_preview, use_container_width=True)
+                        
+                        # Date range selection
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            min_date = cvg_data['Date'].min().date()
+                            max_date = cvg_data['Date'].max().date()
+                            start_date = st.date_input(
+                                "Select Start Date",
+                                value=st.session_state.start_date if st.session_state.start_date else min_date,
+                                min_value=min_date,
+                                max_value=max_date,
+                                key="start_date_input"
+                            )
+                        
+                        with col2:
+                            end_date = st.date_input(
+                                "Select End Date",
+                                value=st.session_state.end_date if st.session_state.end_date else max_date,
+                                min_value=min_date,
+                                max_value=max_date,
+                                key="end_date_input"
+                            )
+                        
+                        # Update session state with selected dates
+                        st.session_state.start_date = start_date
+                        st.session_state.end_date = end_date
+                        
+                        # Validate date range
+                        if start_date >= end_date:
+                            st.error("End date must be after start date")
+                            return
+                        
+                        # Filter data based on selected date range
+                        filtered_data = cvg_data[
+                            (cvg_data['Date'].dt.date >= start_date) &
+                            (cvg_data['Date'].dt.date <= end_date)
+                        ].copy()
+                        
+                        # Store filtered data in session state
+                        st.session_state.filtered_data = filtered_data
+                        
+                        # Show filtered data preview
+                        st.markdown("### 📈 Filtered Data Preview")
+                        fig_filtered = px.line(
+                            filtered_data, x='Date', y='Modal',
+                            title='Filtered Daily Price Data',
+                            labels={'Modal': 'Price (Rs./Quintal)', 'Date': 'Date'},
+                            markers=True
+                        )
+                        fig_filtered.update_traces(connectgaps=False)
+                        fig_filtered.update_layout(hovermode='x unified')
+                        st.plotly_chart(fig_filtered, use_container_width=True)
+                        
+                        # Add Start Analysis button
                         start_analysis = st.button("🚀 Start Analysis", use_container_width=True)
                         
                         if start_analysis:
-                            with st.spinner("Performing analysis..."):
-                                # Validate and clean price data with user-defined threshold
-                                cvg_data, validation_stats = validate_prices(cvg_data, min_price_threshold=st.session_state.min_price_threshold)
+                            with st.spinner("Processing data..."):
+                                # Use the filtered data for analysis
+                                cvg_data = st.session_state.filtered_data.copy()
                                 
-                                # Display validation results
-                                st.markdown("### Data Validation Results")
-                                st.markdown(f"""
-                                - Original records: {validation_stats['original_records']:,}
-                                - Unrealistic records removed: {validation_stats['unrealistic_records']:,} ({validation_stats['removed_percentage']:.2f}%)
-                                - Remaining records: {validation_stats['remaining_records']:,}
-                                """)
-                                
-                                if validation_stats['unrealistic_records'] > 0:
-                                    st.warning(f"⚠️ Removed {validation_stats['unrealistic_records']} records with prices below {min_price_threshold} Rs./Quintal")
-                                
-                                # Proceed only if we have enough data after validation
-                                if len(cvg_data) < 100:
-                                    st.error("❌ Insufficient data remaining after removing unrealistic values. Please adjust the minimum price threshold or select a different CVG.")
-                                    return
-                                
-                                # First interpolate the daily data
-                                cvg_data = interpolate_data(cvg_data)
-                                
-                                # Then create resampled versions
+                                # Create resampled versions
                                 weekly_data = resample_data(cvg_data, 'W')
-                                monthly_data = resample_data(cvg_data, 'ME')
+                                monthly_data = resample_data(cvg_data, 'M')
                                 
-                                # Ensure no missing values in resampled data
-                                weekly_data = interpolate_data(weekly_data)
-                                monthly_data = interpolate_data(monthly_data)
+                                # Interpolate resampled data
+                                weekly_data = smart_interpolate(weekly_data)
+                                monthly_data = smart_interpolate(monthly_data)
                                 
-                                # Perform basic analysis
-                                analysis_results = analyze_data(cvg_data)
+                                # Display analyses in tabs
+                                st.header(f"Analysis Results: {selected_cvg}")
                                 
-                                # Display analyses
-                                st.header(f"Analysis Results for {selected_cvg}")
+                                # Create tabs for different frequencies
+                                weekly_tab, monthly_tab = st.tabs(["Weekly Analysis", "Monthly Analysis"])
                                 
-                                # Data Overview Section
-                                with st.container():
-                                    st.markdown("### 📊 Data Overview")
+                                # Weekly Analysis Tab
+                                with weekly_tab:
+                                    col1, col2 = st.columns([2, 1])
                                     
-                                    # Show date range separately
-                                    start_date = cvg_data['Date'].min().strftime('%Y-%m-%d')
-                                    end_date = cvg_data['Date'].max().strftime('%Y-%m-%d')
-                                    st.markdown(f"**Time Period**: {start_date} to {end_date}")
-                                    st.markdown(f"**Total Records**: {len(cvg_data):,}")
-                                    
-                                    # Create descriptive statistics table
-                                    commodity_name = selected_cvg.split('_')[0]
-                                    
-                                    stats_dict = {
-                                        'Descriptive statistics': [
-                                            'Maximum (Rs./Quintal)',
-                                            'Mean (Rs./Quintal)',
-                                            'Minimum (Rs./Quintal)',
-                                            'Standard deviation (Rs./Quintal)',
-                                            'Coefficient of variation (%)',
-                                            'Skewness',
-                                            'Kurtosis'
-                                        ],
-                                        commodity_name: [
-                                            f"{cvg_data['Modal'].max():.2f}",
-                                            f"{cvg_data['Modal'].mean():.2f}",
-                                            f"{cvg_data['Modal'].min():.2f}",
-                                            f"{cvg_data['Modal'].std():.2f}",
-                                            f"{(cvg_data['Modal'].std() / cvg_data['Modal'].mean() * 100):.2f}",
-                                            f"{cvg_data['Modal'].skew():.2f}",
-                                            f"{cvg_data['Modal'].kurtosis():.2f}"
-                                        ]
-                                    }
-                                    
-                                    stats_df = pd.DataFrame(stats_dict)
-                                    stats_df = stats_df.set_index('Descriptive statistics')
-                                    
-                                    st.table(stats_df.style.set_properties(**{
-                                        'text-align': 'center',
-                                        'font-size': '1em'
-                                    }))
-                                
-                                # Time Series Data Section
-                                with st.container():
-                                    st.markdown("### 📈 Time Series Data")
-                                    
-                                    # Create tabs for different frequencies
-                                    daily_tab, weekly_tab, monthly_tab = st.tabs(["Daily Data", "Weekly Data", "Monthly Data"])
-                                    
-                                    # Daily Data Tab
-                                    with daily_tab:
-                                        st.markdown("#### Daily Price Data")
-                                        
-                                        # Display daily statistics
-                                        daily_stats = get_descriptive_stats(cvg_data, "Daily")
-                                        daily_stats = daily_stats.set_index('Descriptive statistics')
-                                        st.table(daily_stats.style.set_properties(**{
-                                            'text-align': 'center',
-                                            'font-size': '1em'
-                                        }))
-                                        
-                                        # Display ADF test results
-                                        st.markdown("#### Stationarity Test (Daily Data)")
-                                        daily_adf = perform_adf_test(cvg_data, selected_cvg)
-                                        st.table(daily_adf.style.set_properties(**{
-                                            'text-align': 'center',
-                                            'font-size': '1em'
-                                        }))
-                                        
-                                        # Display BDS test results
-                                        st.markdown("#### Nonlinearity Test (Daily Data)")
-                                        try:
-                                            daily_bds = perform_bds_test(cvg_data, selected_cvg)
-                                            st.markdown("BDS test results for different epsilon values (multiples of standard deviation σ):")
-                                            st.table(daily_bds.style.set_properties(**{
-                                                'text-align': 'center',
-                                                'font-size': '1em'
-                                            }))
-                                        except Exception as e:
-                                            st.error(f"Error in BDS test: {str(e)}")
-                                        
-                                        # Interactive line chart for daily data
-                                        fig_daily = px.line(
-                                            cvg_data, x='Date', y='Modal',
-                                            title='Daily Price Data',
-                                            labels={'Modal': 'Price (Rs./Quintal)', 'Date': 'Date'},
-                                            markers=True
-                                        )
-                                        fig_daily.update_traces(connectgaps=False)
-                                        fig_daily.update_layout(hovermode='x unified')
-                                        st.plotly_chart(fig_daily, use_container_width=True)
-                                        
-                                        # Seasonal Decomposition for Daily Data
-                                        st.markdown("#### Time Series Decomposition (Daily)")
-                                        try:
-                                            daily_decomposition = perform_seasonal_decomposition(cvg_data, 'D')
-                                            fig_daily_decomp = plot_decomposition(
-                                                daily_decomposition,
-                                                'Daily Price Time Series Decomposition'
-                                            )
-                                            st.plotly_chart(fig_daily_decomp, use_container_width=True)
-                                        except Exception as e:
-                                            st.warning(f"Could not perform daily decomposition: {str(e)}")
-                                        
-                                        # Download link for daily data
-                                        csv_df = cvg_data[['Date', 'Modal']].copy()
-                                        csv_df['Date'] = csv_df['Date'].dt.strftime('%Y-%m-%d')
-                                        csv = csv_df.to_csv(index=False)
-                                        b64 = base64.b64encode(csv.encode()).decode()
-                                        st.markdown(f'<a href="data:file/csv;base64,{b64}" download="daily_price_data.csv">Download Daily Data (CSV)</a>', unsafe_allow_html=True)
-                                    
-                                    # Weekly Data Tab
-                                    with weekly_tab:
-                                        st.markdown("#### Weekly Price Data")
-                                        
-                                        # Display weekly statistics
-                                        weekly_stats = get_descriptive_stats(weekly_data, "Weekly")
-                                        weekly_stats = weekly_stats.set_index('Descriptive statistics')
-                                        st.table(weekly_stats.style.set_properties(**{
-                                            'text-align': 'center',
-                                            'font-size': '1em'
-                                        }))
-                                        
-                                        # Display ADF test results
-                                        st.markdown("#### Stationarity Test (Weekly Data)")
-                                        weekly_adf = perform_adf_test(weekly_data, selected_cvg)
-                                        st.table(weekly_adf.style.set_properties(**{
-                                            'text-align': 'center',
-                                            'font-size': '1em'
-                                        }))
-                                        
-                                        # Display BDS test results
-                                        st.markdown("#### Nonlinearity Test (Weekly Data)")
-                                        try:
-                                            weekly_bds = perform_bds_test(weekly_data, selected_cvg)
-                                            st.markdown("BDS test results for different epsilon values (multiples of standard deviation σ):")
-                                            st.table(weekly_bds.style.set_properties(**{
-                                                'text-align': 'center',
-                                                'font-size': '1em'
-                                            }))
-                                        except Exception as e:
-                                            st.error(f"Error in BDS test: {str(e)}")
-                                        
-                                        # Interactive line chart for weekly data
+                                    with col1:
+                                        # Weekly price chart
                                         fig_weekly = px.line(
                                             weekly_data, x='Date', y='Modal',
-                                            title='Weekly Price Data',
-                                            labels={'Modal': 'Price (Rs./Quintal)', 'Date': 'Date'},
-                                            markers=True
+                                            title='Weekly Price Trends',
+                                            labels={'Modal': 'Price (₹/Quintal)', 'Date': 'Date'}
                                         )
-                                        fig_weekly.update_traces(connectgaps=False)
-                                        fig_weekly.update_layout(hovermode='x unified')
+                                        fig_weekly.update_layout(
+                                            height=400,
+                                            margin=dict(l=40, r=40, t=40, b=40),
+                                            hovermode='x unified'
+                                        )
                                         st.plotly_chart(fig_weekly, use_container_width=True)
-                                        
-                                        # Seasonal Decomposition for Weekly Data
-                                        st.markdown("#### Time Series Decomposition (Weekly)")
-                                        try:
-                                            weekly_decomposition = perform_seasonal_decomposition(weekly_data, 'W')
-                                            fig_weekly_decomp = plot_decomposition(
-                                                weekly_decomposition,
-                                                'Weekly Price Time Series Decomposition'
-                                            )
-                                            st.plotly_chart(fig_weekly_decomp, use_container_width=True)
-                                        except Exception as e:
-                                            st.warning(f"Could not perform weekly decomposition: {str(e)}")
-                                        
-                                        # Download link for weekly data
-                                        weekly_csv = weekly_data.copy()
-                                        weekly_csv['Date'] = weekly_csv['Date'].dt.strftime('%Y-%m-%d')
-                                        csv = weekly_csv.to_csv(index=False)
-                                        b64 = base64.b64encode(csv.encode()).decode()
-                                        st.markdown(f'<a href="data:file/csv;base64,{b64}" download="weekly_price_data.csv">Download Weekly Data (CSV)</a>', unsafe_allow_html=True)
                                     
-                                    # Monthly Data Tab
-                                    with monthly_tab:
-                                        st.markdown("#### Monthly Price Data")
-                                        
-                                        # Display monthly statistics
-                                        monthly_stats = get_descriptive_stats(monthly_data, "Monthly")
-                                        monthly_stats = monthly_stats.set_index('Descriptive statistics')
-                                        st.table(monthly_stats.style.set_properties(**{
+                                    with col2:
+                                        # Weekly statistics
+                                        st.markdown("#### Statistical Summary")
+                                        weekly_stats = get_descriptive_stats(weekly_data)
+                                        st.table(weekly_stats.style.set_properties(**{
                                             'text-align': 'center',
-                                            'font-size': '1em'
+                                            'font-size': '0.9em'
                                         }))
-                                        
-                                        # Display ADF test results
-                                        st.markdown("#### Stationarity Test (Monthly Data)")
-                                        monthly_adf = perform_adf_test(monthly_data, selected_cvg)
-                                        st.table(monthly_adf.style.set_properties(**{
-                                            'text-align': 'center',
-                                            'font-size': '1em'
-                                        }))
-                                        
-                                        # Display BDS test results
-                                        st.markdown("#### Nonlinearity Test (Monthly Data)")
-                                        try:
-                                            monthly_bds = perform_bds_test(monthly_data, selected_cvg)
-                                            st.markdown("BDS test results for different epsilon values (multiples of standard deviation σ):")
-                                            st.table(monthly_bds.style.set_properties(**{
-                                                'text-align': 'center',
-                                                'font-size': '1em'
-                                            }))
-                                        except Exception as e:
-                                            st.error(f"Error in BDS test: {str(e)}")
-                                        
-                                        # Interactive line chart for monthly data
+                                    
+                                    # Tests results in expandable sections
+                                    col3, col4 = st.columns(2)
+                                    
+                                    with col3:
+                                        with st.expander("Stationarity Analysis"):
+                                            weekly_adf = perform_adf_test(weekly_data, selected_cvg)
+                                            st.table(weekly_adf)
+                                    
+                                    with col4:
+                                        with st.expander("Nonlinearity Analysis"):
+                                            weekly_bds = perform_bds_test(weekly_data, selected_cvg)
+                                            st.table(weekly_bds)
+                                    
+                                    # Decomposition in expander
+                                    with st.expander("Time Series Decomposition"):
+                                        weekly_decomp = perform_seasonal_decomposition(weekly_data, 'W')
+                                        fig_weekly_decomp = plot_decomposition(
+                                            weekly_decomp,
+                                            'Weekly Price Components'
+                                        )
+                                        st.plotly_chart(fig_weekly_decomp, use_container_width=True)
+                                
+                                # Monthly Analysis Tab
+                                with monthly_tab:
+                                    col1, col2 = st.columns([2, 1])
+                                    
+                                    with col1:
+                                        # Monthly price chart
                                         fig_monthly = px.line(
                                             monthly_data, x='Date', y='Modal',
-                                            title='Monthly Price Data',
-                                            labels={'Modal': 'Price (Rs./Quintal)', 'Date': 'Date'},
-                                            markers=True
+                                            title='Monthly Price Trends',
+                                            labels={'Modal': 'Price (₹/Quintal)', 'Date': 'Date'}
                                         )
-                                        fig_monthly.update_traces(connectgaps=False)
-                                        fig_monthly.update_layout(hovermode='x unified')
+                                        fig_monthly.update_layout(
+                                            height=400,
+                                            margin=dict(l=40, r=40, t=40, b=40),
+                                            hovermode='x unified'
+                                        )
                                         st.plotly_chart(fig_monthly, use_container_width=True)
-                                        
-                                        # Seasonal Decomposition for Monthly Data
-                                        st.markdown("#### Time Series Decomposition (Monthly)")
-                                        try:
-                                            monthly_decomposition = perform_seasonal_decomposition(monthly_data, 'M')
-                                            fig_monthly_decomp = plot_decomposition(
-                                                monthly_decomposition,
-                                                'Monthly Price Time Series Decomposition'
-                                            )
-                                            st.plotly_chart(fig_monthly_decomp, use_container_width=True)
-                                        except Exception as e:
-                                            st.warning(f"Could not perform monthly decomposition: {str(e)}")
-                                        
-                                        # Download link for monthly data
+                                    
+                                    with col2:
+                                        # Monthly statistics
+                                        st.markdown("#### Statistical Summary")
+                                        monthly_stats = get_descriptive_stats(monthly_data)
+                                        st.table(monthly_stats.style.set_properties(**{
+                                            'text-align': 'center',
+                                            'font-size': '0.9em'
+                                        }))
+                                    
+                                    # Tests results in expandable sections
+                                    col3, col4 = st.columns(2)
+                                    
+                                    with col3:
+                                        with st.expander("Stationarity Analysis"):
+                                            monthly_adf = perform_adf_test(monthly_data, selected_cvg)
+                                            st.table(monthly_adf)
+                                    
+                                    with col4:
+                                        with st.expander("Nonlinearity Analysis"):
+                                            monthly_bds = perform_bds_test(monthly_data, selected_cvg)
+                                            st.table(monthly_bds)
+                                    
+                                    # Decomposition in expander
+                                    with st.expander("Time Series Decomposition"):
+                                        monthly_decomp = perform_seasonal_decomposition(monthly_data, 'M')
+                                        fig_monthly_decomp = plot_decomposition(
+                                            monthly_decomp,
+                                            'Monthly Price Components'
+                                        )
+                                        st.plotly_chart(fig_monthly_decomp, use_container_width=True)
+                                
+                                # Export options in a single expander
+                                with st.expander("Export Data"):
+                                    col1, col2 = st.columns(2)
+                                    
+                                    with col1:
+                                        # Weekly data export
+                                        weekly_csv = weekly_data.copy()
+                                        weekly_csv['Date'] = weekly_csv['Date'].dt.strftime('%Y-%m-%d')
+                                        weekly_b64 = base64.b64encode(weekly_csv.to_csv(index=False).encode()).decode()
+                                        st.markdown(f'<a href="data:file/csv;base64,{weekly_b64}" download="weekly_prices.csv" class="download-button">📥 Download Weekly Data</a>', unsafe_allow_html=True)
+                                    
+                                    with col2:
+                                        # Monthly data export
                                         monthly_csv = monthly_data.copy()
                                         monthly_csv['Date'] = monthly_csv['Date'].dt.strftime('%Y-%m-%d')
-                                        csv = monthly_csv.to_csv(index=False)
-                                        b64 = base64.b64encode(csv.encode()).decode()
-                                        st.markdown(f'<a href="data:file/csv;base64,{b64}" download="monthly_price_data.csv">Download Monthly Data (CSV)</a>', unsafe_allow_html=True)
-
-                                # Generate and download report
-                                report_text = generate_report(cvg_data, selected_cvg, analysis_results)
-                                st.markdown(get_download_link(report_text, f"{selected_cvg}_analysis_report.txt"), unsafe_allow_html=True)
-                            
-                            st.success("Analysis completed successfully!")
+                                        monthly_b64 = base64.b64encode(monthly_csv.to_csv(index=False).encode()).decode()
+                                        st.markdown(f'<a href="data:file/csv;base64,{monthly_b64}" download="monthly_prices.csv" class="download-button">📥 Download Monthly Data</a>', unsafe_allow_html=True)
+                                
+                                st.success("✅ Analysis completed successfully!")
         
         except Exception as e:
             st.error(f"Error processing file: {str(e)}")
